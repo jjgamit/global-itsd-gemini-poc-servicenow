@@ -227,6 +227,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def normalize_reference(value: Any) -> str:
+    """Return a readable display value for a ServiceNow reference field.
+
+    ServiceNow reference fields may arrive as objects such as
+    {"display_value": "Customer Support", "link": "https://..."}.
+    Do not stringify the whole object, because that leaks a Python dict
+    representation into the Infinity handoff context.
+    """
+    if isinstance(value, dict):
+        value = value.get("display_value") or value.get("value") or value.get("name") or ""
+    if value is None:
+        return ""
+    return str(value).strip()
+
 GEMINI_WS_URL = (
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -435,9 +450,6 @@ class BotConversation:
     # handoff even if Gemini omits identity fields from tool arguments.
     last_employee_lookup: Dict[str, Any] = field(default_factory=dict)
     last_concern_type: str = ""
-    # Stage ticket details during AI self-service; create a real record only at handoff.
-    staged_ticket: Dict[str, Any] = field(default_factory=dict)
-    created_handoff_ticket: Dict[str, Any] = field(default_factory=dict)
 
 
 class GeminiService(ServicePlugin):
@@ -1999,11 +2011,6 @@ class GeminiService(ServicePlugin):
                                                 "concern_category": {"type": "string", "description": "Compatibility alias for concern_type"},
                                                 "issue_summary": {"type": "string"},
                                                 "data_source": {"type": "string"},
-                                                "ticket_number": {"type": "string"},
-                                                "ticket_type": {"type": "string"},
-                                                "incident_number": {"type": "string"},
-                                                "incident_sys_id": {"type": "string"},
-                                                "incident_url": {"type": "string"},
                                             },
                                             "required": [],
                                         },
@@ -2053,7 +2060,7 @@ class GeminiService(ServicePlugin):
                             },
                             {
                                 "name": "itsd_create_ticket",
-                                "description": "Prepare ticket details for a possible live-agent transfer. Do not create a ServiceNow record during the AI conversation; the bridge creates it once when transfer_to_agent is invoked.",
+                                "description": "Create a simulated ServiceNow incident or service request record in the in-memory POC only. Never creates a real ServiceNow record.",
                                 "parameters": {
                                     "type": "object",
                                     "properties": {
@@ -2580,27 +2587,18 @@ class GeminiService(ServicePlugin):
                 )
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_create_ticket":
-                # Stage only. create_mock_ticket creates a real ServiceNow record,
-                # so do not call it until the caller is actually being transferred.
                 ticket_category = str(args.get("category") or "general").strip().lower()
                 if ticket_category:
                     convo.last_concern_type = ticket_category
-                convo.staged_ticket = {
-                    "record_type": str(args.get("record_type") or "incident").strip().lower(),
-                    "employee_id": str(args.get("employee_id") or ""),
-                    "region": str(args.get("region") or ""),
-                    "short_description": str(args.get("short_description") or ""),
-                    "description": str(args.get("description") or ""),
-                    "category": ticket_category,
-                    "kb_article_id": str(args.get("kb_article_id") or ""),
-                }
-                result = {
-                    "staged": True,
-                    "created": False,
-                    "message": "Ticket details are prepared only. No ServiceNow record has been created yet. A record will be created if the caller is transferred to a live agent.",
-                    "ticket_draft": convo.staged_ticket,
-                    "data_source": "SERVICENOW",
-                }
+                result = create_mock_ticket(
+                    record_type=str(args.get("record_type") or "incident"),
+                    employee_id=str(args.get("employee_id") or ""),
+                    region=str(args.get("region") or ""),
+                    short_description=str(args.get("short_description") or ""),
+                    description=str(args.get("description") or ""),
+                    category=ticket_category,
+                    kb_article_id=str(args.get("kb_article_id") or ""),
+                )
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_get_regional_route":
                 result = get_regional_route(str(args.get("region") or ""))
@@ -2628,14 +2626,24 @@ class GeminiService(ServicePlugin):
                     "employee_id", "employee_name", "first_name", "last_name", "email",
                     "department", "region", "account_status", "concern_type",
                     "concern_category", "issue_summary", "data_source",
-                    "ticket_number", "ticket_type", "incident_number", "incident_sys_id",
-                    "incident_url", "ticket_sys_id", "ticket_url", "kb_article_id", "routing_target",
+                    "ticket_number", "ticket_type", "ticket_created", "ticket_sys_id", "ticket_url",
+                    "incident_number", "incident_sys_id", "incident_url",
+                    "kb_article_id", "routing_target",
                 )
                 handoff_context = {"reason": reason}
                 for field_name in allowed_context_fields:
                     value = raw_context.get(field_name)
-                    if value is not None and str(value).strip():
-                        handoff_context[field_name] = str(value)[:500]
+                    if value is None:
+                        continue
+                    if field_name == "department":
+                        normalized_value = normalize_reference(value)
+                    elif isinstance(value, (dict, list, tuple)):
+                        # Keep nested objects out of the flat Infinity context.
+                        normalized_value = normalize_reference(value)
+                    else:
+                        normalized_value = str(value).strip()
+                    if normalized_value:
+                        handoff_context[field_name] = normalized_value[:500]
 
                 employee = convo.last_employee_lookup if isinstance(convo.last_employee_lookup, dict) else {}
                 first_name = str(employee.get("first_name") or employee.get("firstName") or "").strip()
@@ -2656,9 +2664,12 @@ class GeminiService(ServicePlugin):
                 handoff_context.setdefault("first_name", first_name)
                 handoff_context.setdefault("last_name", last_name)
                 handoff_context.setdefault("email", str(employee.get("email") or employee.get("email_address") or employee.get("emailAddress") or ""))
-                handoff_context.setdefault("department", str(employee.get("department") or ""))
+                handoff_context.setdefault("department", normalize_reference(employee.get("department")))
                 handoff_context.setdefault("region", str(employee.get("region") or ""))
                 handoff_context.setdefault("account_status", str(employee.get("account_status") or employee.get("accountStatus") or ""))
+
+                # Ensure the final payload always exposes department as a plain label.
+                handoff_context["department"] = normalize_reference(handoff_context.get("department"))
 
                 concern_type = str(
                     handoff_context.get("concern_type") or handoff_context.get("concern_category")
@@ -2679,76 +2690,6 @@ class GeminiService(ServicePlugin):
                         concern_type = "general"
                 handoff_context["concern_type"] = concern_type
                 handoff_context["concern_category"] = concern_type
-
-                # Create the ServiceNow record at the transfer boundary, not
-                # during AI self-service. Cache successful creation to prevent
-                # duplicate incidents if Gemini invokes transfer more than once.
-                ticket_result = convo.created_handoff_ticket
-                if not ticket_result:
-                    staged = convo.staged_ticket if isinstance(convo.staged_ticket, dict) else {}
-                    issue_summary = str(
-                        handoff_context.get("issue_summary")
-                        or staged.get("short_description")
-                        or reason
-                        or "IT Service Desk assistance requested"
-                    ).strip()
-                    issue_description = str(
-                        staged.get("description")
-                        or handoff_context.get("issue_summary")
-                        or reason
-                        or issue_summary
-                    ).strip()
-                    employee_id = str(handoff_context.get("employee_id") or staged.get("employee_id") or "").strip()
-                    region = str(handoff_context.get("region") or staged.get("region") or "").strip()
-                    try:
-                        ticket_result = create_mock_ticket(
-                            record_type=str(staged.get("record_type") or "incident"),
-                            employee_id=employee_id,
-                            region=region,
-                            short_description=issue_summary[:160],
-                            description=issue_description,
-                            category=str(staged.get("category") or handoff_context.get("concern_type") or concern_type or "general").strip().lower(),
-                            kb_article_id=str(staged.get("kb_article_id") or ""),
-                        )
-                    except Exception as exc:
-                        logger.exception("[%s] ServiceNow ticket creation failed during handoff", convo.client_id)
-                        ticket_result = {
-                            "created": False,
-                            "message": f"ServiceNow ticket creation failed: {exc}",
-                            "data_source": "SERVICENOW",
-                        }
-                    if isinstance(ticket_result, dict) and ticket_result.get("created"):
-                        convo.created_handoff_ticket = dict(ticket_result)
-
-                if isinstance(ticket_result, dict) and ticket_result.get("created"):
-                    ticket = ticket_result.get("ticket") or {}
-                    if not isinstance(ticket, dict):
-                        ticket = {}
-                    number = str(ticket.get("number") or ticket.get("ticket_number") or "").strip()
-                    sys_id = str(ticket.get("sys_id") or "").strip()
-                    record_url = str(ticket.get("servicenow_url") or ticket.get("url") or "").strip()
-                    if number:
-                        handoff_context["ticket_number"] = number
-                        handoff_context["incident_number"] = number
-                    if sys_id:
-                        handoff_context["incident_sys_id"] = sys_id
-                        handoff_context["ticket_sys_id"] = sys_id
-                    if record_url:
-                        handoff_context["incident_url"] = record_url
-                        handoff_context["ticket_url"] = record_url
-                    handoff_context["ticket_type"] = str(ticket.get("record_type") or "incident")
-                    handoff_context["data_source"] = "SERVICENOW"
-                    handoff_context["ticket_created"] = "true"
-                    logger.info("[%s] ServiceNow record created for handoff: number=%s sys_id=%s",
-                                convo.client_id, number or "(missing)", sys_id or "(missing)")
-                else:
-                    handoff_context["ticket_created"] = "false"
-                    handoff_context["ticket_creation_error"] = str(
-                        ticket_result.get("message") if isinstance(ticket_result, dict)
-                        else "ServiceNow returned no creation result"
-                    )[:500]
-                    logger.error("[%s] No ServiceNow ticket created for handoff: %s",
-                                 convo.client_id, handoff_context["ticket_creation_error"])
 
                 handoff_payload = {
                     "ftype": "LIVE_AGENT_HANDOFF",
