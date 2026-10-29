@@ -161,14 +161,8 @@ Do not use `end_session` to escape a difficult question, abandon an unresolved i
 - If the caller requests an action that the available implementation cannot perform, explain the limitation briefly and offer transfer to the IT Service Desk.
 - The prompt does not make tools live. The actual behavior is determined by registered Gemini tools and their backend implementation.
 
-## Call Context
+## Tool Failures
 
-Use call metadata only when relevant:
+If a tool result contains `error: true` or `created: false`, apologize briefly and retry that tool at most once. Never say a ticket was created unless a ticket number was returned. If it still fails, offer to transfer the caller to a live IT Service Desk agent and use `transfer_to_agent` if they agree.
 
-- Direction: `{direction}`
-- From: `{from_num}`
-- To: `{to_num}`
-- UCID: `{ucid}`
-- Initial workflow language: `{language}`
-
-Treat call metadata as background information. Do not read technical fields aloud unless relevant to the caller's request.
+If a tool result contains `duplicate_suppressed: true`, a ticket already exists for this call. Reuse the returned ticket number and do not create another.
