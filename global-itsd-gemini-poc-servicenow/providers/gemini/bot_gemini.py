@@ -452,6 +452,8 @@ class BotConversation:
     # Cache the latest successful ticket result so transfer_to_agent can add
     # the real ServiceNow record identifiers even if Gemini omits them.
     last_ticket_result: Dict[str, Any] = field(default_factory=dict)
+    # Cache the latest KB result so Infinity handoff can display its reference.
+    last_kb_article: Dict[str, Any] = field(default_factory=dict)
     last_concern_type: str = ""
 
 
@@ -2023,6 +2025,11 @@ class GeminiService(ServicePlugin):
                                                 "concern_category": {"type": "string", "description": "Compatibility alias for concern_type"},
                                                 "issue_summary": {"type": "string"},
                                                 "data_source": {"type": "string"},
+                                                "kb_article_id": {"type": "string"},
+                                                "kb_article_number": {"type": "string"},
+                                                "kb_article_title": {"type": "string"},
+                                                "kb_article_source": {"type": "string"},
+                                                "kb_article_url": {"type": "string"},
                                             },
                                             "required": [],
                                         },
@@ -2633,6 +2640,20 @@ class GeminiService(ServicePlugin):
                         result["articles"] = normalized_articles
                         result["count"] = len(normalized_articles)
                         result["found"] = bool(normalized_articles)
+                        # Store only the first returned article reference for this call.
+                        # Clear old metadata when a search has no result to avoid stale references.
+                        convo.last_kb_article = {}
+                        if normalized_articles:
+                            first = normalized_articles[0]
+                            ref = first.get("reference") if isinstance(first.get("reference"), dict) else first
+                            convo.last_kb_article = {
+                                "kb_article_id": str(first.get("article_id") or ref.get("kb_number") or "").strip(),
+                                "kb_article_number": str(ref.get("kb_number") or first.get("kb_number") or first.get("article_id") or "").strip(),
+                                "kb_article_title": str(ref.get("title") or first.get("title") or "").strip(),
+                                "kb_article_source": str(ref.get("source") or first.get("source") or "").strip(),
+                                "kb_article_url": str(ref.get("url") or first.get("url") or "").strip(),
+                                "data_source": str(result.get("data_source") or first.get("data_source") or "").strip(),
+                            }
 
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_self_service_action":
@@ -2717,7 +2738,8 @@ class GeminiService(ServicePlugin):
                     "concern_category", "issue_summary", "data_source",
                     "ticket_number", "ticket_type", "ticket_created", "ticket_sys_id", "ticket_url",
                     "incident_number", "incident_sys_id", "incident_url",
-                    "kb_article_id", "routing_target",
+                    "kb_article_id", "kb_article_number", "kb_article_title",
+                    "kb_article_source", "kb_article_url", "routing_target",
                 )
                 handoff_context = {"reason": reason}
                 for field_name in allowed_context_fields:
@@ -2759,6 +2781,17 @@ class GeminiService(ServicePlugin):
 
                 # Ensure the final payload always exposes department as a plain label.
                 handoff_context["department"] = normalize_reference(handoff_context.get("department"))
+
+                # Enrich the handoff with the latest KB article reference, unless
+                # Gemini explicitly supplied a value. The UI should render these
+                # fields only when a real returned reference is present.
+                kb_article = convo.last_kb_article if isinstance(convo.last_kb_article, dict) else {}
+                for field_name in ("kb_article_id", "kb_article_number", "kb_article_title", "kb_article_source", "kb_article_url"):
+                    value = str(kb_article.get(field_name) or "").strip()
+                    if value:
+                        handoff_context.setdefault(field_name, value[:500])
+                if kb_article.get("data_source"):
+                    handoff_context.setdefault("kb_data_source", str(kb_article["data_source"])[:100])
 
                 # Enrich the handoff from the last successful ticket creation.
                 # Explicit values supplied in raw_context take precedence; the
