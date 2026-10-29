@@ -449,6 +449,9 @@ class BotConversation:
     # Last simulated employee lookup for this call. Used to enrich every
     # handoff even if Gemini omits identity fields from tool arguments.
     last_employee_lookup: Dict[str, Any] = field(default_factory=dict)
+    # Cache the latest successful ticket result so transfer_to_agent can add
+    # the real ServiceNow record identifiers even if Gemini omits them.
+    last_ticket_result: Dict[str, Any] = field(default_factory=dict)
     last_concern_type: str = ""
 
 
@@ -2599,6 +2602,17 @@ class GeminiService(ServicePlugin):
                     category=ticket_category,
                     kb_article_id=str(args.get("kb_article_id") or ""),
                 )
+                # Keep ticket metadata in per-call state. Gemini may not repeat
+                # these values in transfer_to_agent's handoff_context arguments.
+                if isinstance(result, dict) and result.get("created") is True:
+                    ticket_record = result.get("ticket") or result.get("data") or {}
+                    if isinstance(ticket_record, dict):
+                        convo.last_ticket_result = dict(ticket_record)
+                    else:
+                        convo.last_ticket_result = {}
+                else:
+                    # Do not accidentally reuse a previous ticket after a failed create.
+                    convo.last_ticket_result = {}
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_get_regional_route":
                 result = get_regional_route(str(args.get("region") or ""))
@@ -2670,6 +2684,40 @@ class GeminiService(ServicePlugin):
 
                 # Ensure the final payload always exposes department as a plain label.
                 handoff_context["department"] = normalize_reference(handoff_context.get("department"))
+
+                # Enrich the handoff from the last successful ticket creation.
+                # Explicit values supplied in raw_context take precedence; the
+                # cached backend result fills missing fields only. The backend's
+                # result shape is {created: true, ticket: {...}} and commonly
+                # uses number, sys_id, and servicenow_url inside ticket.
+                ticket = convo.last_ticket_result if isinstance(convo.last_ticket_result, dict) else {}
+                if ticket:
+                    ticket_number = str(ticket.get("number") or ticket.get("ticket_number") or "").strip()
+                    ticket_sys_id = str(ticket.get("sys_id") or ticket.get("ticket_sys_id") or ticket.get("incident_sys_id") or "").strip()
+                    ticket_url = str(ticket.get("servicenow_url") or ticket.get("ticket_url") or ticket.get("incident_url") or "").strip()
+                    ticket_type = str(ticket.get("record_type") or ticket.get("ticket_type") or "").strip().lower()
+                    ticket_created = bool(ticket_number and (ticket.get("real_servicenow_record_created") is not False))
+                    if ticket_number:
+                        handoff_context.setdefault("ticket_number", ticket_number)
+                        if ticket_type == "incident" or ticket_number.upper().startswith("INC"):
+                            handoff_context.setdefault("incident_number", ticket_number)
+                    if ticket_sys_id:
+                        handoff_context.setdefault("ticket_sys_id", ticket_sys_id)
+                        if ticket_type == "incident" or ticket_number.upper().startswith("INC"):
+                            handoff_context.setdefault("incident_sys_id", ticket_sys_id)
+                    if ticket_url:
+                        handoff_context.setdefault("ticket_url", ticket_url)
+                        if ticket_type == "incident" or ticket_number.upper().startswith("INC"):
+                            handoff_context.setdefault("incident_url", ticket_url)
+                    if ticket_type:
+                        handoff_context.setdefault("ticket_type", ticket_type)
+                    # Never mark a simulated record as a real ServiceNow record.
+                    if ticket.get("real_servicenow_record_created") is True:
+                        handoff_context.setdefault("ticket_created", "true")
+                        handoff_context.setdefault("data_source", "SERVICENOW")
+                    elif ticket.get("real_servicenow_record_created") is False:
+                        handoff_context.setdefault("ticket_created", "simulated")
+                        handoff_context.setdefault("data_source", str(ticket.get("data_source") or "SIMULATED"))
 
                 concern_type = str(
                     handoff_context.get("concern_type") or handoff_context.get("concern_category")
