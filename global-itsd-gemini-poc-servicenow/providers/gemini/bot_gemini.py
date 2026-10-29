@@ -2000,7 +2000,7 @@ class GeminiService(ServicePlugin):
                                             "type": "object",
                                             "description": (
                                                 "Non-sensitive summary for the human agent. "
-                                                "Include only simulated employee details and issue summary."
+                                                "Include only non-sensitive employee details and an issue summary."
                                             ),
                                             "properties": {
                                                 "employee_id": {"type": "string"},
@@ -2037,7 +2037,7 @@ class GeminiService(ServicePlugin):
                             
                             {
                                 "name": "itsd_search_kb",
-                                "description": "Search the simulated approved ServiceNow knowledge base for password reset, account lockout, or access request guidance. Returns mock KB articles only.",
+                                "description": "Search the IT Service Desk knowledge base for password reset, account lockout, or access request guidance. Returns published ServiceNow articles when available, otherwise approved fallback articles.",
                                 "parameters": {
                                     "type": "object",
                                     "properties": {
@@ -2049,7 +2049,7 @@ class GeminiService(ServicePlugin):
                             },
                             {
                                 "name": "itsd_self_service_action",
-                                "description": "Run a simulated self-service walkthrough for password reset, account unlock, or access request. It does not change any real account or submit any real request.",
+                                "description": "Get the approved self-service walkthrough for password reset, account unlock, or access request. It does not change an account unless the result says real_system_changed is true.",
                                 "parameters": {
                                     "type": "object",
                                     "properties": {
@@ -2063,7 +2063,7 @@ class GeminiService(ServicePlugin):
                             },
                             {
                                 "name": "itsd_create_ticket",
-                                "description": "Create a simulated ServiceNow incident or service request record in the in-memory POC only. Never creates a real ServiceNow record.",
+                                "description": "Create a ServiceNow incident or service request for the caller's issue and return the ticket number. Create at most one record per issue.",
                                 "parameters": {
                                     "type": "object",
                                     "properties": {
@@ -2090,8 +2090,8 @@ class GeminiService(ServicePlugin):
                             {
                                 "name": "itsd_lookup_employee",
                                 "description": (
-                                    "Look up an employee ID in the simulated "
-                                    "Global IT Service Desk demo dataset. "
+                                    "Look up an employee by ID in ServiceNow. "
+                                    "Returns name, department, region and account status. "
                                     "This is not identity verification."
                                 ),
                                 "parameters": {
@@ -2576,13 +2576,14 @@ class GeminiService(ServicePlugin):
                 category = str(args.get("category") or "general").strip().lower()
                 if category:
                     convo.last_concern_type = category
-                result = search_kb(str(args.get("query") or ""), category)
+                result = await asyncio.to_thread(search_kb, str(args.get("query") or ""), category)
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_self_service_action":
                 action = str(args.get("action") or "").strip().lower()
                 if action in ("password_reset", "account_unlock", "access_request"):
                     convo.last_concern_type = {"account_unlock": "account_lockout"}.get(action, action)
-                result = run_self_service(
+                result = await asyncio.to_thread(
+                    run_self_service,
                     employee_id=str(args.get("employee_id") or ""),
                     action=action,
                     application=str(args.get("application") or ""),
@@ -2593,15 +2594,27 @@ class GeminiService(ServicePlugin):
                 ticket_category = str(args.get("category") or "general").strip().lower()
                 if ticket_category:
                     convo.last_concern_type = ticket_category
-                result = create_mock_ticket(
-                    record_type=str(args.get("record_type") or "incident"),
-                    employee_id=str(args.get("employee_id") or ""),
-                    region=str(args.get("region") or ""),
-                    short_description=str(args.get("short_description") or ""),
-                    description=str(args.get("description") or ""),
-                    category=ticket_category,
-                    kb_article_id=str(args.get("kb_article_id") or ""),
-                )
+                requested_type = str(args.get("record_type") or "incident").strip().lower()
+                prior_ticket = convo.last_ticket_result if isinstance(convo.last_ticket_result, dict) else {}
+                if prior_ticket.get("number") and str(prior_ticket.get("record_type") or "").lower() == requested_type:
+                    # These are real ServiceNow records: never create a second one on the same call.
+                    result = {
+                        "created": True,
+                        "duplicate_suppressed": True,
+                        "ticket": dict(prior_ticket),
+                        "note": "A ticket already exists for this call. Reuse this ticket number; do not create another.",
+                    }
+                else:
+                    result = await asyncio.to_thread(
+                        create_mock_ticket,
+                        record_type=str(args.get("record_type") or "incident"),
+                        employee_id=str(args.get("employee_id") or ""),
+                        region=str(args.get("region") or ""),
+                        short_description=str(args.get("short_description") or ""),
+                        description=str(args.get("description") or ""),
+                        category=ticket_category,
+                        kb_article_id=str(args.get("kb_article_id") or ""),
+                    )
                 # Keep ticket metadata in per-call state. Gemini may not repeat
                 # these values in transfer_to_agent's handoff_context arguments.
                 if isinstance(result, dict) and result.get("created") is True:
@@ -2613,13 +2626,18 @@ class GeminiService(ServicePlugin):
                 else:
                     # Do not accidentally reuse a previous ticket after a failed create.
                     convo.last_ticket_result = {}
+                # The cache above keeps the full record for the agent screenpop; Gemini only
+                # sees the safe fields so it never reads a URL aloud.
+                if isinstance(result, dict) and isinstance(result.get("ticket"), dict):
+                    result = {**result, "ticket": {k: v for k, v in result["ticket"].items()
+                                                   if k not in ("servicenow_url", "sys_id")}}
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_get_regional_route":
                 result = get_regional_route(str(args.get("region") or ""))
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_lookup_employee":
                 employee_id = str(args.get("employee_id") or "")
-                lookup_result = lookup_employee(employee_id)
+                lookup_result = await asyncio.to_thread(lookup_employee, employee_id)
                 # Cache the successful employee lookup for this call so the
                 # handoff payload can reliably include employee identity.
                 if isinstance(lookup_result, dict) and lookup_result.get("found"):
