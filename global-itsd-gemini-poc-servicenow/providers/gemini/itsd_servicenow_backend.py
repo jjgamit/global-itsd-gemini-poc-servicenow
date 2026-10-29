@@ -1,19 +1,20 @@
 """ServiceNow-backed Global IT Service Desk backend for the POC.
 
 Drop-in replacement for itsd_mock_backend.py: same function names, same return
-shapes, so bot_gemini.py only needs small changes (see the patch notes).
+shapes, so bot_gemini.py needs only small changes.
 
 Env vars (Railway):
   SN_INSTANCE          https://dev400307.service-now.com   (no trailing slash)
   SN_USER / SN_PASS    integration account (itil role; user_admin only if unlock is on)
   SN_TIMEOUT_S         request timeout in seconds (default 6, keep it short for voice)
+  SN_KB_SYS_ID         optional: sys_id of ONE knowledge base to search (keeps demo articles out)
   ITSD_DEFAULT_REGION  region used when a user has no APAC/EMEA/AMER Location (default APAC)
   ITSD_ALLOW_UNLOCK    "true" lets account_unlock really clear locked_out (default false)
 
 What is real vs. simulated:
   lookup_employee      real   (sys_user)
   create_mock_ticket   real   (incident / sc_request)
-  search_kb            real   (kb_knowledge), falls back to the approved mock KB
+  search_kb            real   (kb_knowledge, title match), falls back to the approved mock KB
   run_self_service     guidance from the approved KB; unlock is real only if enabled
   get_regional_route   label only (same as the mock)
 """
@@ -165,35 +166,68 @@ def lookup_employee(employee_id: str) -> dict:
 
 
 # ----------------------------------------------------------------- knowledge
+# Words that identify each category in an article TITLE. When the bot passes a
+# known category we match on these instead of the caller's free-text query.
+_KB_CATEGORY_TERMS = {
+    "password_reset": ["password", "reset", "forgot", "expired"],
+    "account_lockout": ["locked", "lockout", "unlock"],
+    "access_request": ["access", "permission", "entitlement"],
+}
+
+
+def _clean(fragment):
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()[:300]
+
+
 def _steps_from_html(html):
+    # Prefer real list items (numbered steps); fall back to plain lines.
+    items = re.findall(r"<li[^>]*>(.*?)</li>", html or "", flags=re.I | re.S)
+    steps = [s for s in (_clean(i) for i in items) if s]
+    if steps:
+        return steps[:8]
     text = re.sub(r"<(br|/p|/li|/div|/h\d|/tr)[^>]*>", "\n", html or "", flags=re.I)
-    text = unescape(re.sub(r"<[^>]+>", " ", text))
-    lines = [re.sub(r"\s+", " ", ln).strip()[:300] for ln in text.split("\n")]
+    lines = [_clean(ln) for ln in text.split("\n")]
     return [ln for ln in lines if ln][:8]
 
 
 def search_kb(query: str, category: str = "general") -> dict:
-    terms = [t for t in re.findall(r"[A-Za-z0-9]+", str(query or "").lower()) if len(t) > 2][:3]
+    cat = str(category or "general").lower().strip()
+    terms = _KB_CATEGORY_TERMS.get(cat) or [
+        t for t in re.findall(r"[a-z0-9]+", str(query or "").lower()) if len(t) > 3
+    ][:4]
+
     if terms:
-        likes = "^OR".join(f"short_descriptionLIKE{t}^ORtextLIKE{t}" for t in terms)
+        # Match on the TITLE only. Matching the article body is what pulled in
+        # unrelated phishing / Windows articles for "password reset".
+        likes = "^OR".join(f"short_descriptionLIKE{t}" for t in terms)
+        base_q = "workflow_state=published"
+        kb_id = os.getenv("SN_KB_SYS_ID", "").strip()  # optional: limit to one knowledge base
+        if re.fullmatch(r"[0-9a-f]{32}", kb_id):
+            base_q += f"^kb_knowledge_base={kb_id}"
         try:
             rows = _request(
                 "GET",
                 "/api/now/table/kb_knowledge",
                 params={
-                    "sysparm_query": f"workflow_state=published^{likes}",
-                    "sysparm_limit": 3,
+                    "sysparm_query": f"{base_q}^{likes}",
+                    "sysparm_limit": 10,
                     "sysparm_fields": "number,short_description,text",
                 },
             ) or []
         except ServiceNowError as exc:
-            logger.warning("KB search failed, using approved mock KB: %s", exc)
+            logger.warning("KB search failed, using approved KB: %s", exc)
             rows = []
+
+        def score(r):
+            title = str(r.get("short_description") or "").lower()
+            return sum(1 for t in terms if t in title)
+
+        rows = sorted(rows, key=score, reverse=True)[:3]
         articles = [
             {
                 "article_id": r.get("number"),
                 "title": r.get("short_description"),
-                "category": str(category or "general"),
+                "category": cat,
                 "steps": _steps_from_html(r.get("text")),
                 "safety_note": _SAFETY_NOTE,
             }
@@ -202,7 +236,8 @@ def search_kb(query: str, category: str = "general") -> dict:
         if articles:
             return {"found": True, "articles": articles, "count": len(articles),
                     "data_source": "SERVICENOW_KB", "note": "Published ServiceNow knowledge articles."}
-    # Nothing in ServiceNow (a PDI has no password-reset articles) -> approved POC articles.
+
+    # No title match in ServiceNow -> approved POC articles.
     return _mock.search_kb(query, category)
 
 
@@ -296,4 +331,7 @@ def list_mock_tickets() -> list:
 if __name__ == "__main__":
     # Quick test:  python itsd_servicenow_backend.py
     print(lookup_employee("EMP1001"))
-    print(search_kb("password reset", "password_reset").get("data_source"))
+    for q, c in (("password reset", "password_reset"), ("account locked", "account_lockout"),
+                 ("application access", "access_request")):
+        r = search_kb(q, c)
+        print(q, "->", r.get("data_source"), [a.get("title") for a in r.get("articles", [])])
