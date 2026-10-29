@@ -1264,7 +1264,16 @@ class GeminiService(ServicePlugin):
                 "This policy overrides conflicting language instructions above. Preserve all tool calls, "
                 "business rules, and LIVE_AGENT_HANDOFF behavior; do not translate IDs or tool arguments."
             )
-        return f"{interpolated}\n\n{context_line}" + language_policy
+        kb_reference_policy = (
+            "\\n\\nKNOWLEDGE BASE REFERENCE POLICY: When you use itsd_search_kb and it returns "
+            "one or more articles, base your troubleshooting guidance on the returned article content. "
+            "Mention the returned KB number and title in your answer. If source and URL are present, "
+            "include them as the source reference. Never invent or guess a KB number, title, source, or URL. "
+            "If no relevant article is found, say that no matching KB article was found and do not fabricate a citation. "
+            "For voice, say the KB number and title naturally; the transcript or agent-facing response may include "
+            "the full source and URL."
+        )
+        return f"{interpolated}\\n\\n{context_line}" + language_policy + kb_reference_policy
 
     # ------------------------------------------------------------------ bot.end
 
@@ -2037,7 +2046,7 @@ class GeminiService(ServicePlugin):
                             
                             {
                                 "name": "itsd_search_kb",
-                                "description": "Search the IT Service Desk knowledge base for password reset, account lockout, or access request guidance. Returns published ServiceNow articles when available, otherwise approved fallback articles.",
+                                "description": "Search the IT Service Desk knowledge base for password reset, account lockout, or access request guidance. Returns article number, title, source knowledge base, URL, and steps when available. When using the result, cite the returned KB number and title; never invent a reference.",
                                 "parameters": {
                                     "type": "object",
                                     "properties": {
@@ -2573,10 +2582,58 @@ class GeminiService(ServicePlugin):
                 args = {}
 
             if name == "itsd_search_kb":
+                query = str(args.get("query") or "").strip()
                 category = str(args.get("category") or "general").strip().lower()
+                if category not in {
+                    "password_reset", "account_lockout", "access_request", "general"
+                }:
+                    category = "general"
                 if category:
                     convo.last_concern_type = category
-                result = await asyncio.to_thread(search_kb, str(args.get("query") or ""), category)
+
+                result = await asyncio.to_thread(search_kb, query, category)
+
+                # Keep the KB reference metadata explicit in the tool result sent to Gemini.
+                # ServiceNow-backed articles may use either kb_number or article_id.
+                if isinstance(result, dict):
+                    articles = result.get("articles")
+                    if isinstance(articles, list):
+                        normalized_articles = []
+                        for article in articles:
+                            if not isinstance(article, dict):
+                                continue
+                            item = dict(article)
+                            kb_number = str(
+                                item.get("kb_number") or item.get("article_id") or item.get("number") or ""
+                            ).strip()
+                            title = str(item.get("title") or item.get("short_description") or "").strip()
+                            source = normalize_reference(item.get("source") or item.get("kb_knowledge_base"))
+                            url = str(item.get("url") or item.get("article_url") or "").strip()
+
+                            if kb_number:
+                                item["kb_number"] = kb_number
+                            if title:
+                                item["title"] = title
+                            if source:
+                                item["source"] = source
+                            if url:
+                                item["url"] = url
+
+                            # Provide a single structured reference object for reliable downstream use.
+                            if kb_number or title or source or url:
+                                item["reference"] = {
+                                    key: value for key, value in {
+                                        "kb_number": kb_number,
+                                        "title": title,
+                                        "source": source,
+                                        "url": url,
+                                    }.items() if value
+                                }
+                            normalized_articles.append(item)
+                        result["articles"] = normalized_articles
+                        result["count"] = len(normalized_articles)
+                        result["found"] = bool(normalized_articles)
+
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_self_service_action":
                 action = str(args.get("action") or "").strip().lower()
